@@ -260,6 +260,10 @@ static bool float_fits_width(double val, uint8_t bw) {
     return bw == 4 || bw == 8;
 }
 
+enum {
+    MFX_VERIFY_MAX_DEPTH = 64
+};
+
 /* ── Reader ─────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -306,12 +310,15 @@ static bool get_vector_info(mfx_ref ref, vector_info *out) {
 
 mfx_ref mfx_root(const uint8_t *buf, uint32_t size) {
     mfx_ref ref = {0};
+    uint8_t root_bw;
 
     if (!buf || size < 3) return ref;
-    if (!bw_is_valid(buf[size - 1])) return ref;
+    root_bw = buf[size - 1];
+    if (!bw_is_valid(root_bw)) return ref;
+    if (root_bw > size - 2) return ref;
 
-    ref.data = buf + size - 2 - buf[size - 1];
-    ref.parent_width = buf[size - 1];
+    ref.data = buf + size - 2 - root_bw;
+    ref.parent_width = root_bw;
     ref.byte_width = bw_from_log2(buf[size - 2] & 3);
     ref.type = buf[size - 2] >> 2;
     if (!type_is_known(ref.type)) return (mfx_ref){0};
@@ -633,7 +640,7 @@ static bool verify_nt_string(verify_ctx *ctx, const uint8_t *p) {
     return false;
 }
 
-static bool verify_ref(verify_ctx *ctx, mfx_ref ref);
+static bool verify_ref(verify_ctx *ctx, mfx_ref ref, uint32_t depth);
 
 static bool verify_map_keys(verify_ctx *ctx, mfx_ref ref, uint32_t count) {
     const uint8_t *p;
@@ -664,14 +671,14 @@ static bool verify_map_keys(verify_ctx *ctx, mfx_ref ref, uint32_t count) {
         if (!verify_deref(ctx, slot, keys_bw, &key_ptr)) return false;
         if (!verify_nt_string(ctx, key_ptr)) return false;
         cur = (const char *)key_ptr;
-        if (prev && strcmp(prev, cur) > 0) return false;
+        if (prev && strcmp(prev, cur) >= 0) return false;
         prev = cur;
     }
 
     return true;
 }
 
-static bool verify_vector_like(verify_ctx *ctx, mfx_ref ref) {
+static bool verify_vector_like(verify_ctx *ctx, mfx_ref ref, uint32_t depth) {
     vector_info info;
     uint32_t i;
 
@@ -694,16 +701,17 @@ static bool verify_vector_like(verify_ctx *ctx, mfx_ref ref) {
         mfx_ref elem = mfx_vec_at(ref, i);
         if (!type_is_known(elem.type)) return false;
         if (info.has_type_table && !bw_is_valid(elem.byte_width)) return false;
-        if (!verify_ref(ctx, elem)) return false;
+        if (!verify_ref(ctx, elem, depth + 1)) return false;
     }
 
     return true;
 }
 
-static bool verify_ref(verify_ctx *ctx, mfx_ref ref) {
+static bool verify_ref(verify_ctx *ctx, mfx_ref ref, uint32_t depth) {
     const uint8_t *p;
     uint32_t len;
 
+    if (depth > MFX_VERIFY_MAX_DEPTH) return false;
     if (!type_is_known(ref.type)) return false;
     if (!bw_is_valid(ref.parent_width) || !bw_is_valid(ref.byte_width)) return false;
     if (!verify_range(ctx, ref.data, ref.parent_width)) return false;
@@ -728,7 +736,7 @@ static bool verify_ref(verify_ctx *ctx, mfx_ref ref) {
             len = (uint32_t)read_uint(p - ref.byte_width, ref.byte_width);
             return verify_range(ctx, p, len);
         default:
-            return verify_vector_like(ctx, ref);
+            return verify_vector_like(ctx, ref, depth);
     }
 }
 
@@ -744,7 +752,7 @@ bool mfx_verify(const uint8_t *buf, uint32_t size) {
     ctx.end = buf + size;
 
     if (!verify_range(&ctx, root.data, root.parent_width)) return false;
-    return verify_ref(&ctx, root);
+    return verify_ref(&ctx, root, 0);
 }
 
 /* ── Writer ─────────────────────────────────────────────────────── */
@@ -952,7 +960,8 @@ static void push_key_if_needed(mfx_builder *b, const char *key) {
     push_value(b, (build_value){ .type = MFX_FBT_KEY, .min_bit_width = 0, .val.offset = write_key(b, key) });
 }
 
-static uint8_t compute_element_bw(build_value *vals, uint32_t count, uint32_t base_pos, uint32_t prefix_elems, uint8_t initial_bw, bool fixed) {
+static uint8_t compute_element_bw_stride(build_value *vals, uint32_t start, uint32_t stride, uint32_t count,
+                                        uint32_t base_pos, uint32_t prefix_elems, uint8_t initial_bw, bool fixed) {
     uint8_t bw_log2 = initial_bw;
     int pass;
 
@@ -963,9 +972,10 @@ static uint8_t compute_element_bw(build_value *vals, uint32_t count, uint32_t ba
         uint32_t i;
 
         for (i = 0; i < count; i++) {
-            uint8_t w = vals[i].min_bit_width;
-            if (type_is_offset_encoded(vals[i].type)) {
-                uint8_t off_w = width_for_offset(vals[i].val.offset, data_start + i * bw);
+            build_value v = vals[start + i * stride];
+            uint8_t w = v.min_bit_width;
+            if (type_is_offset_encoded(v.type)) {
+                uint8_t off_w = width_for_offset(v.val.offset, data_start + i * bw);
                 if (off_w > w) w = off_w;
             }
             if (w > new_bw) new_bw = w;
@@ -976,6 +986,10 @@ static uint8_t compute_element_bw(build_value *vals, uint32_t count, uint32_t ba
     }
 
     return bw_log2;
+}
+
+static uint8_t compute_element_bw(build_value *vals, uint32_t count, uint32_t base_pos, uint32_t prefix_elems, uint8_t initial_bw, bool fixed) {
+    return compute_element_bw_stride(vals, 0, 1, count, base_pos, prefix_elems, initial_bw, fixed);
 }
 
 static void write_value_at_width(mfx_builder *b, build_value v, uint8_t byte_width) {
@@ -1080,7 +1094,6 @@ static build_value write_map(mfx_builder *b, build_value *vals, uint32_t count) 
     uint8_t val_bw;
     uint32_t keys_vec_offset;
     uint32_t map_offset;
-    build_value *value_entries;
     uint32_t i;
 
     sort_map_pairs(b, vals, count);
@@ -1099,14 +1112,7 @@ static build_value write_map(mfx_builder *b, build_value *vals, uint32_t count) 
         buf_write_uint(b, delta, keys_bw);
     }
 
-    value_entries = (build_value *)malloc(npairs * sizeof(build_value));
-    if (!value_entries) {
-        builder_fail_msg(b, "out of memory");
-        return (build_value){0};
-    }
-    for (i = 0; i < npairs; i++) value_entries[i] = vals[i * 2 + 1];
-
-    val_bw_log2 = compute_element_bw(value_entries, npairs, b->buf_size, 3, width_for_uint(npairs), false);
+    val_bw_log2 = compute_element_bw_stride(vals, 1, 2, npairs, b->buf_size, 3, width_for_uint(npairs), false);
     if (width_for_offset(keys_vec_offset, b->buf_size) > val_bw_log2) val_bw_log2 = width_for_offset(keys_vec_offset, b->buf_size);
     val_bw = bw_from_log2(val_bw_log2);
 
@@ -1116,13 +1122,13 @@ static build_value write_map(mfx_builder *b, build_value *vals, uint32_t count) 
     buf_write_uint(b, npairs, val_bw);
     map_offset = b->buf_size;
 
-    for (i = 0; i < npairs; i++) write_value_at_width(b, value_entries[i], val_bw);
+    for (i = 0; i < npairs; i++) write_value_at_width(b, vals[i * 2 + 1], val_bw);
     for (i = 0; i < npairs; i++) {
-        uint8_t stored_width = type_is_inline_scalar(value_entries[i].type) ? val_bw_log2 : value_entries[i].min_bit_width;
-        buf_write_byte(b, packed_type(value_entries[i].type, stored_width));
+        build_value v = vals[i * 2 + 1];
+        uint8_t stored_width = type_is_inline_scalar(v.type) ? val_bw_log2 : v.min_bit_width;
+        buf_write_byte(b, packed_type(v.type, stored_width));
     }
 
-    free(value_entries);
     return (build_value){ .type = MFX_FBT_MAP, .min_bit_width = val_bw_log2, .val.offset = map_offset };
 }
 

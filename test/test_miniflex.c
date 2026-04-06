@@ -455,6 +455,9 @@ static void test_verify_failures(void) {
     uint32_t size = 0;
     uint8_t *data;
     uint8_t *bad;
+    uint32_t tiny_size = 0;
+    uint8_t *tiny_data;
+    mfx_ref root;
     mfx_builder *b = mfx_builder_create();
 
     printf("test_verify_failures...\n");
@@ -474,6 +477,20 @@ static void test_verify_failures(void) {
     bad[size - 1] = 3;
     ASSERT(!mfx_verify(bad, size), "bad root width fails verify");
     free(bad);
+
+    b = mfx_builder_create();
+    mfx_build_null(b, NULL);
+    tiny_data = mfx_build_finish(b, &tiny_size);
+    mfx_builder_destroy(b);
+
+    bad = (uint8_t *)malloc(tiny_size);
+    memcpy(bad, tiny_data, tiny_size);
+    bad[tiny_size - 1] = 8;
+    root = mfx_root(bad, tiny_size);
+    ASSERT(root.data == NULL, "out-of-bounds root width returns invalid root");
+    ASSERT(!mfx_verify(bad, tiny_size), "out-of-bounds root width fails verify");
+    free(bad);
+    free(tiny_data);
     free(data);
 }
 
@@ -520,6 +537,56 @@ static void test_builder_errors(void) {
     mfx_builder_destroy(b);
 }
 
+static void test_verify_duplicate_keys(void) {
+    uint32_t size = 0;
+    uint8_t *data;
+    char *second_key;
+    mfx_builder *b = mfx_builder_create();
+    mfx_ref root;
+
+    printf("test_verify_duplicate_keys...\n");
+
+    mfx_build_map_start(b, NULL);
+    mfx_build_int(b, "a", 1);
+    mfx_build_int(b, "b", 2);
+    mfx_build_map_end(b);
+
+    data = mfx_build_finish(b, &size);
+    mfx_builder_destroy(b);
+
+    ASSERT(mfx_verify(data, size), "baseline map verifies");
+
+    root = mfx_root(data, size);
+    second_key = (char *)mfx_map_key_at(root, 1);
+    ASSERT(second_key != NULL, "second key available");
+    second_key[0] = 'a';
+
+    ASSERT(!mfx_verify(data, size), "duplicate keys fail verify");
+
+    free(data);
+}
+
+static void test_verify_depth_limit(void) {
+    uint32_t size = 0;
+    uint8_t *data;
+    mfx_builder *b = mfx_builder_create();
+    int i;
+
+    printf("test_verify_depth_limit...\n");
+
+    for (i = 0; i < 66; i++) mfx_build_vector_start(b, NULL);
+    mfx_build_null(b, NULL);
+    for (i = 0; i < 66; i++) mfx_build_vector_end(b);
+
+    data = mfx_build_finish(b, &size);
+    mfx_builder_destroy(b);
+
+    ASSERT(data != NULL, "deep buffer built");
+    ASSERT(!mfx_verify(data, size), "excessively deep nesting fails verify");
+
+    free(data);
+}
+
 int main(void) {
     test_simple_map();
     test_vector();
@@ -535,6 +602,8 @@ int main(void) {
     test_vector_string_deprecated();
     test_vector_key();
     test_verify_failures();
+    test_verify_duplicate_keys();
+    test_verify_depth_limit();
     test_mutation_failures();
     test_builder_errors();
 
